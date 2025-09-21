@@ -1,7 +1,11 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-python-dotenv==1.0.0
+fastapi==0.116.2
+growwapi==0.0.9
+pydantic==2.11.9
+python-dotenv==1.1.1
+schedule==1.2.2
+uvicorn==0.35.0
+python-multipart==0.0.12
+smartapi-python==1.5.5
+logzero==1.7.0
+websocket-client==1.8.0
 pyotp==2.9.0
-smartapi-python==1.3.0
-schedule==1.2.0
