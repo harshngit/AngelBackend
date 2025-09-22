@@ -11,8 +11,9 @@ from datetime import datetime, time, timedelta
 import threading
 import schedule
 import time as time_module
-from typing import List, Literal
+from typing import List, Literal, Dict, Any
 import pyotp
+from bs4 import BeautifulSoup as bs
 
 # Import SmartAPI
 try:
@@ -35,9 +36,9 @@ else:
 
 # FastAPI initialization
 app = FastAPI(
-    title="Angel One Stock Data API",
-    description="API for OHLC data and market movers using Angel One SmartAPI with persistent tokens",
-    version="2.0.0"
+    title="Angel One Stock Data API with Chartink Scanner",
+    description="API for OHLC data, market movers using Angel One SmartAPI and Chartink stock scanner",
+    version="2.1.0"
 )
 
 # CORS middleware
@@ -62,6 +63,21 @@ class MarketMoversRequest(BaseModel):
     datatype: Literal["PercOIGainers", "PercOILosers", "PercPriceGainers", "PercPriceLosers"]
     expirytype: Literal["NEAR", "NEXT", "FAR"] = "NEAR"
 
+class ScanCondition(BaseModel):
+    scan_clause: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "scan_clause": "( {cash} ( daily max( 5 , daily close ) > 6 days ago max( 120 , daily close ) * 1.05 and daily volume > daily sma( volume,5 ) and daily close > 1 day ago close ) )"
+            }
+        }
+
+class StockData(BaseModel):
+    data: List[Dict[str, Any]]
+    total_count: int
+    timestamp: str
+
 # Angel One API credentials
 api_key = os.getenv("ANGEL_API_KEY", "").strip()
 client_id = os.getenv("ANGEL_CLIENT_ID", "").strip()
@@ -74,6 +90,66 @@ auth_token = None
 refresh_token = None
 feed_token = None
 last_token_refresh = None
+
+# Chartink Scraper Class
+class ChartinkScraper:
+    """Scraper class for Chartink"""
+    
+    def __init__(self):
+        self.base_url = "https://chartink.com/screener/process"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def get_csrf_token(self) -> str:
+        """Fetch CSRF token from Chartink"""
+        try:
+            response = self.session.get(self.base_url, timeout=10)
+            response.raise_for_status()
+            
+            soup = bs(response.content, "html.parser")
+            meta = soup.find("meta", {"name": "csrf-token"})
+            
+            if not meta:
+                raise ValueError("CSRF token not found")
+            
+            return meta["content"]
+        except Exception as e:
+            print(f"❌ Error fetching CSRF token: {e}")
+            raise
+    
+    def fetch_stocks(self, scan_clause: str) -> Dict[str, Any]:
+        """Fetch stock data based on scan conditions"""
+        try:
+            # Get CSRF token
+            csrf_token = self.get_csrf_token()
+            
+            # Prepare headers and data
+            headers = {"x-csrf-token": csrf_token}
+            condition = {"scan_clause": scan_clause}
+            
+            # Make POST request
+            response = self.session.post(
+                self.base_url,
+                headers=headers,
+                data=condition,
+                timeout=15
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            return data
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request error: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error fetching stocks: {e}")
+            raise
+
+# Initialize Chartink scraper
+chartink_scraper = ChartinkScraper()
 
 def save_tokens_to_file():
     """Save tokens to file for persistence"""
@@ -214,19 +290,10 @@ def ensure_valid_session():
     return smart_api
 
 def fetch_market_movers_rest(datatype: str, expirytype: str):
-    """Call Angel One REST API for Market Movers when SDK lacks method.
-
-    Args:
-        datatype: One of PercOIGainers, PercOILosers, PercPriceGainers, PercPriceLosers
-        expirytype: One of NEAR, NEXT, FAR
-
-    Returns:
-        Parsed JSON dict from API.
-    """
+    """Call Angel One REST API for Market Movers when SDK lacks method."""
     if not auth_token:
         raise HTTPException(status_code=500, detail="No auth token available for REST call")
 
-    # Correct Angel One endpoint for gainers/losers
     url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/gainersLosers"
     
     headers = {
@@ -242,16 +309,13 @@ def fetch_market_movers_rest(datatype: str, expirytype: str):
         "X-ClientCode": client_id
     }
     
-    # Payload as per API specification
     payload = {
         "datatype": datatype,
         "expirytype": expirytype
     }
 
     try:
-        # This API only accepts POST method
         response = requests.post(url, headers=headers, json=payload, timeout=20)
-        # If unauthorized at HTTP level, handle below
         if response.status_code == 401:
             raise requests.exceptions.HTTPError("401 Unauthorized", response=response)
         response.raise_for_status()
@@ -264,10 +328,8 @@ def fetch_market_movers_rest(datatype: str, expirytype: str):
                 detail=f"Angel REST non-JSON response (status {response.status_code}): {response.text[:500]}"
             )
 
-        # Handle logical invalid token even if HTTP 200
         message = (data.get("message") or "").lower()
         if (not data.get("status")) and ("invalid token" in message or "token expired" in message):
-            # Try refresh then full login
             refresh_session()
             retry_headers = {
                 **headers,
@@ -275,7 +337,6 @@ def fetch_market_movers_rest(datatype: str, expirytype: str):
             }
             retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
             if retry_resp.status_code == 401:
-                # Force full login
                 full_login()
                 retry_headers2 = {
                     **headers,
@@ -294,7 +355,6 @@ def fetch_market_movers_rest(datatype: str, expirytype: str):
         return data
             
     except requests.exceptions.HTTPError as http_err:
-        # If unauthorized, try refreshing and retry once
         if response.status_code == 401:
             refresh_session()
             retry_headers = {
@@ -304,7 +364,6 @@ def fetch_market_movers_rest(datatype: str, expirytype: str):
             
             retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
             if retry_resp.status_code == 401:
-                # Force full login then retry again
                 full_login()
                 retry_headers = {
                     **headers,
@@ -366,13 +425,14 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "service": "Angel One Stock Data API (30-day persistent)",
+        "service": "Angel One Stock Data API with Chartink Scanner",
         "timestamp": str(datetime.now()),
         "session_active": auth_token is not None,
         "refresh_token_available": refresh_token is not None,
         "last_refresh": str(last_token_refresh) if last_token_refresh else None,
         "token_age": token_age,
-        "credentials_loaded": bool(all([api_key, client_id, password, totp_token]))
+        "credentials_loaded": bool(all([api_key, client_id, password, totp_token])),
+        "chartink_scanner": "enabled"
     }
 
 @app.post("/get-ohlc")
@@ -386,7 +446,7 @@ async def get_ohlc(request: OHLCRequest):
         
         ohlc_data = api.ltpData(
             exchange=request.exchange,
-            tradingsymbol=request.tradingSymbol,  # lowercase: tradingsymbol
+            tradingsymbol=request.tradingSymbol,
             symboltoken=request.symbolToken
         )
         
@@ -419,7 +479,6 @@ async def get_ohlc(request: OHLCRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching OHLC data: {str(e)}")
 
-
 @app.post("/get-ohlc-batch")
 async def get_ohlc_batch(request: OHLCBatchRequest):
     """Get OHLC data for multiple stock symbols"""
@@ -436,7 +495,7 @@ async def get_ohlc_batch(request: OHLCBatchRequest):
             try:
                 ohlc_data = api.ltpData(
                     exchange=symbol.get('exchange', 'NSE'),
-                    tradingsymbol=symbol['tradingSymbol'],  # lowercase: tradingsymbol
+                    tradingsymbol=symbol['tradingSymbol'],
                     symboltoken=symbol['symbolToken']
                 )
                 
@@ -491,6 +550,35 @@ async def get_market_movers(request: MarketMoversRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching market movers: {str(e)}")
 
+@app.post("/scan", response_model=StockData)
+async def scan_stocks(condition: ScanCondition):
+    """
+    Scan stocks with Chartink custom conditions
+    
+    - **scan_clause**: Chartink scan condition query
+    """
+    try:
+        print(f"📊 Scanning with condition: {condition.scan_clause}")
+        
+        # Fetch data from Chartink
+        result = chartink_scraper.fetch_stocks(condition.scan_clause)
+        
+        if not result or "data" not in result:
+            raise HTTPException(status_code=404, detail="No data found")
+        
+        return {
+            "data": result["data"],
+            "total_count": len(result["data"]),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Request failed: {e}")
+        raise HTTPException(status_code=503, detail="Failed to fetch data from Chartink")
+    except Exception as e:
+        print(f"❌ Scan failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/session-status")
 async def session_status():
     """Get current session status"""
@@ -515,7 +603,8 @@ async def session_status():
             "client_id_loaded": bool(client_id),
             "password_loaded": bool(password),
             "totp_token_loaded": bool(totp_token)
-        }
+        },
+        "chartink_scanner": "active"
     }
 
 @app.post("/refresh-session")
