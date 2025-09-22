@@ -5,6 +5,7 @@ import sys
 import os
 import json
 from dotenv import load_dotenv
+import requests
 from pathlib import Path
 from datetime import datetime, time, timedelta
 import threading
@@ -212,6 +213,119 @@ def ensure_valid_session():
     refresh_session()
     return smart_api
 
+def fetch_market_movers_rest(datatype: str, expirytype: str):
+    """Call Angel One REST API for Market Movers when SDK lacks method.
+
+    Args:
+        datatype: One of PercOIGainers, PercOILosers, PercPriceGainers, PercPriceLosers
+        expirytype: One of NEAR, NEXT, FAR
+
+    Returns:
+        Parsed JSON dict from API.
+    """
+    if not auth_token:
+        raise HTTPException(status_code=500, detail="No auth token available for REST call")
+
+    # Correct Angel One endpoint for gainers/losers
+    url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/gainersLosers"
+    
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "AA-BB-CC-11-22-33",
+        "X-PrivateKey": api_key,
+        "X-ClientCode": client_id
+    }
+    
+    # Payload as per API specification
+    payload = {
+        "datatype": datatype,
+        "expirytype": expirytype
+    }
+
+    try:
+        # This API only accepts POST method
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        # If unauthorized at HTTP level, handle below
+        if response.status_code == 401:
+            raise requests.exceptions.HTTPError("401 Unauthorized", response=response)
+        response.raise_for_status()
+        
+        try:
+            data = response.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Angel REST non-JSON response (status {response.status_code}): {response.text[:500]}"
+            )
+
+        # Handle logical invalid token even if HTTP 200
+        message = (data.get("message") or "").lower()
+        if (not data.get("status")) and ("invalid token" in message or "token expired" in message):
+            # Try refresh then full login
+            refresh_session()
+            retry_headers = {
+                **headers,
+                "Authorization": f"Bearer {auth_token}"
+            }
+            retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            if retry_resp.status_code == 401:
+                # Force full login
+                full_login()
+                retry_headers2 = {
+                    **headers,
+                    "Authorization": f"Bearer {auth_token}"
+                }
+                retry_resp = requests.post(url, headers=retry_headers2, json=payload, timeout=20)
+            retry_resp.raise_for_status()
+            try:
+                return retry_resp.json()
+            except ValueError:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Angel REST non-JSON response after reauth (status {retry_resp.status_code}): {retry_resp.text[:500]}"
+                )
+
+        return data
+            
+    except requests.exceptions.HTTPError as http_err:
+        # If unauthorized, try refreshing and retry once
+        if response.status_code == 401:
+            refresh_session()
+            retry_headers = {
+                **headers,
+                "Authorization": f"Bearer {auth_token}"
+            }
+            
+            retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            if retry_resp.status_code == 401:
+                # Force full login then retry again
+                full_login()
+                retry_headers = {
+                    **headers,
+                    "Authorization": f"Bearer {auth_token}"
+                }
+                retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            retry_resp.raise_for_status()
+            
+            try:
+                return retry_resp.json()
+            except ValueError:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Angel REST non-JSON response after refresh (status {retry_resp.status_code}): {retry_resp.text[:500]}"
+                )
+        
+        raise HTTPException(status_code=502, detail=f"Angel REST error: {http_err}")
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Angel REST network error: {str(e)}")
+
 def schedule_token_refresh():
     """Schedule automatic token refresh every 5 hours"""
     schedule.every(5).hours.do(refresh_session)
@@ -360,32 +474,22 @@ async def get_ohlc_batch(request: OHLCBatchRequest):
 
 @app.post("/get-market-movers")
 async def get_market_movers(request: MarketMoversRequest):
-    """Get top gainers/losers data"""
+    """Get top gainers/losers data via Angel One REST API."""
     try:
-        api = ensure_valid_session()
-        
-        if not api:
-            raise HTTPException(status_code=500, detail="Angel One session not initialized")
-        
-        movers_data = api.marketData(
-            mode=request.datatype,
-            exchangeTokens={"NFO": []}
-        )
-        
-        if movers_data and movers_data.get('status'):
+        ensure_valid_session()
+        data = fetch_market_movers_rest(datatype=request.datatype, expirytype=request.expirytype)
+        if data and data.get("status"):
             return {
                 "status": True,
                 "message": "SUCCESS",
                 "errorcode": "",
-                "data": movers_data.get('data', [])
+                "data": data.get("data", [])
             }
-        else:
-            raise HTTPException(status_code=500, detail=movers_data.get('message', 'Failed to fetch market movers'))
-            
+        raise HTTPException(status_code=500, detail=data.get("message", "Failed to fetch market movers"))
     except HTTPException as he:
         raise he
     except Exception as e:
-        raise HTTPException(status_code=501, detail=f"Market movers endpoint needs Angel One API adjustment: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching market movers: {str(e)}")
 
 @app.get("/session-status")
 async def session_status():
