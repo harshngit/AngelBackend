@@ -3,11 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import sys
 import os
+import json
 from dotenv import load_dotenv
 import requests
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import datetime, time, timedelta
+import threading
+import schedule
+import time as time_module
+from typing import List, Literal, Dict, Any, Optional
+import pyotp
 from bs4 import BeautifulSoup as bs
 import asyncio
 import logging
@@ -15,6 +20,14 @@ import logging
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import SmartAPI
+try:
+    from SmartApi import SmartConnect
+except ImportError:
+    print("❌ ERROR: smartapi-python not installed!")
+    print("Please run: pip install smartapi-python")
+    sys.exit(1)
 
 # Try to import Option Trading System
 try:
@@ -101,6 +114,7 @@ except ImportError as e:
 # Load environment variables
 BASE_DIR = Path(__file__).resolve().parent
 env_path = BASE_DIR / ".env"
+TOKEN_FILE = BASE_DIR / "angel_tokens.json"
 
 if env_path.exists():
     load_dotenv(dotenv_path=env_path, override=True)
@@ -110,9 +124,9 @@ else:
 
 # FastAPI initialization
 app = FastAPI(
-    title="Unified Trading API - Option Trading & Chartink",
-    description="Combined API for Option Trading System and Chartink Scanner",
-    version="2.0.0"
+    title="Unified Trading API - Angel One + Option Trading System",
+    description="Combined API for Angel One Stock Data, Chartink Scanner, and Option Trading System",
+    version="3.0.0"
 )
 
 # CORS middleware
@@ -124,7 +138,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== MODELS ====================
+# ==================== ANGEL ONE MODELS ====================
+class OHLCRequest(BaseModel):
+    exchange: str = "NSE"
+    tradingSymbol: str
+    symbolToken: str
+
+class OHLCBatchRequest(BaseModel):
+    symbols: List[dict]
+
+class MarketMoversRequest(BaseModel):
+    datatype: Literal["PercOIGainers", "PercOILosers", "PercPriceGainers", "PercPriceLosers"]
+    expirytype: Literal["NEAR", "NEXT", "FAR"] = "NEAR"
+
 class ScanCondition(BaseModel):
     scan_clause: str
     
@@ -140,6 +166,7 @@ class StockData(BaseModel):
     total_count: int
     timestamp: str
 
+# ==================== OPTION TRADING MODELS ====================
 class TradingRequest(BaseModel):
     symbol: str = Field(..., description="Trading symbol (NIFTY, BANKNIFTY, etc.)")
     option_expiry: str = Field(..., description="Option expiry date")
@@ -150,6 +177,19 @@ class IndexSelectionRequest(BaseModel):
     index: str = Field(..., description="Index name")
     expiry_date: Optional[str] = Field(None, description="Specific expiry date")
     strike_range: Optional[int] = Field(20, description="Number of strikes to fetch")
+
+# Angel One API credentials
+api_key = os.getenv("ANGEL_API_KEY", "").strip()
+client_id = os.getenv("ANGEL_CLIENT_ID", "").strip()
+password = os.getenv("ANGEL_PASSWORD", "").strip()
+totp_token = os.getenv("ANGEL_TOTP_TOKEN", "").strip()
+
+# Global variables for Angel One
+smart_api = None
+auth_token = None
+refresh_token = None
+feed_token = None
+last_token_refresh = None
 
 # Global variables for Option Trading System
 trading_system: Optional[OptionTradingSystem] = None
@@ -216,6 +256,254 @@ class ChartinkScraper:
 
 # Initialize Chartink scraper
 chartink_scraper = ChartinkScraper()
+
+# ==================== ANGEL ONE FUNCTIONS ====================
+def save_tokens_to_file():
+    """Save tokens to file for persistence"""
+    try:
+        token_data = {
+            "refresh_token": refresh_token,
+            "auth_token": auth_token,
+            "feed_token": feed_token,
+            "last_refresh": last_token_refresh.isoformat() if last_token_refresh else None,
+            "client_id": client_id
+        }
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump(token_data, f, indent=2)
+        print(f"💾 Tokens saved to {TOKEN_FILE}")
+    except Exception as e:
+        print(f"⚠️  Error saving tokens: {e}")
+
+def load_tokens_from_file():
+    """Load tokens from file"""
+    global refresh_token, auth_token, feed_token, last_token_refresh
+    
+    try:
+        if TOKEN_FILE.exists():
+            with open(TOKEN_FILE, 'r') as f:
+                token_data = json.load(f)
+            
+            if token_data.get('client_id') == client_id:
+                refresh_token = token_data.get('refresh_token')
+                auth_token = token_data.get('auth_token')
+                feed_token = token_data.get('feed_token')
+                
+                last_refresh_str = token_data.get('last_refresh')
+                if last_refresh_str:
+                    last_token_refresh = datetime.fromisoformat(last_refresh_str)
+                
+                print(f"📂 Loaded tokens from file (last refresh: {last_token_refresh})")
+                return True
+            else:
+                print("⚠️  Token file is for different client, ignoring")
+                return False
+        return False
+    except Exception as e:
+        print(f"⚠️  Error loading tokens: {e}")
+        return False
+
+def generate_totp():
+    """Generate TOTP for 2FA"""
+    try:
+        totp = pyotp.TOTP(totp_token)
+        return totp.now()
+    except Exception as e:
+        print(f"❌ Error generating TOTP: {e}")
+        raise HTTPException(status_code=500, detail=f"TOTP generation failed: {str(e)}")
+
+def full_login():
+    """Perform full TOTP login (only when refresh token expires)"""
+    global smart_api, auth_token, refresh_token, feed_token, last_token_refresh
+    
+    try:
+        if not all([api_key, client_id, password, totp_token]):
+            raise HTTPException(
+                status_code=500,
+                detail="Missing Angel One credentials. Check environment variables."
+            )
+        
+        print(f"🔐 [{datetime.now()}] Performing FULL LOGIN with TOTP...")
+        
+        smart_api = SmartConnect(api_key=api_key)
+        totp_code = generate_totp()
+        data = smart_api.generateSession(client_id, password, totp_code)
+        
+        if data['status']:
+            auth_token = data['data']['jwtToken']
+            refresh_token = data['data']['refreshToken']
+            feed_token = smart_api.getfeedToken()
+            last_token_refresh = datetime.now()
+            
+            save_tokens_to_file()
+            
+            print(f"✅ FULL LOGIN successful! Refresh token valid for ~30 days")
+            print(f"   Auth Token: {auth_token[:20]}...")
+            print(f"   Refresh Token: {refresh_token[:20]}...")
+            return True
+        else:
+            raise HTTPException(status_code=500, detail=f"Login failed: {data.get('message', 'Unknown error')}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error during full login: {e}")
+        raise HTTPException(status_code=500, detail=f"Full login failed: {str(e)}")
+
+def refresh_session():
+    """Refresh session using refresh token (no TOTP needed!)"""
+    global smart_api, auth_token, feed_token, last_token_refresh
+    
+    try:
+        if not refresh_token:
+            print("⚠️  No refresh token available, performing full login...")
+            return full_login()
+        
+        print(f"🔄 [{datetime.now()}] Refreshing session using refresh token...")
+        
+        if not smart_api:
+            smart_api = SmartConnect(api_key=api_key)
+        
+        data = smart_api.generateToken(refresh_token)
+        
+        if data['status']:
+            auth_token = data['data']['jwtToken']
+            feed_token = data['data']['feedToken']
+            last_token_refresh = datetime.now()
+            
+            save_tokens_to_file()
+            
+            print(f"✅ Session refreshed successfully! (No TOTP needed)")
+            return True
+        else:
+            print(f"⚠️  Refresh token expired or invalid: {data.get('message')}")
+            print("   Performing full login...")
+            return full_login()
+            
+    except Exception as e:
+        print(f"⚠️  Error refreshing session: {e}")
+        print("   Attempting full login...")
+        return full_login()
+
+def ensure_valid_session():
+    """Ensure we have a valid session (auto-refresh if needed)"""
+    global last_token_refresh
+    
+    if auth_token and last_token_refresh:
+        time_since_refresh = datetime.now() - last_token_refresh
+        if time_since_refresh < timedelta(hours=5):
+            return smart_api
+    
+    refresh_session()
+    return smart_api
+
+def fetch_market_movers_rest(datatype: str, expirytype: str):
+    """Call Angel One REST API for Market Movers when SDK lacks method."""
+    if not auth_token:
+        raise HTTPException(status_code=500, detail="No auth token available for REST call")
+
+    url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/gainersLosers"
+    
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "AA-BB-CC-11-22-33",
+        "X-PrivateKey": api_key,
+        "X-ClientCode": client_id
+    }
+    
+    payload = {
+        "datatype": datatype,
+        "expirytype": expirytype
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        if response.status_code == 401:
+            raise requests.exceptions.HTTPError("401 Unauthorized", response=response)
+        response.raise_for_status()
+        
+        try:
+            data = response.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Angel REST non-JSON response (status {response.status_code}): {response.text[:500]}"
+            )
+
+        message = (data.get("message") or "").lower()
+        if (not data.get("status")) and ("invalid token" in message or "token expired" in message):
+            refresh_session()
+            retry_headers = {
+                **headers,
+                "Authorization": f"Bearer {auth_token}"
+            }
+            retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            if retry_resp.status_code == 401:
+                full_login()
+                retry_headers2 = {
+                    **headers,
+                    "Authorization": f"Bearer {auth_token}"
+                }
+                retry_resp = requests.post(url, headers=retry_headers2, json=payload, timeout=20)
+            retry_resp.raise_for_status()
+            try:
+                return retry_resp.json()
+            except ValueError:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Angel REST non-JSON response after reauth (status {retry_resp.status_code}): {retry_resp.text[:500]}"
+                )
+
+        return data
+            
+    except requests.exceptions.HTTPError as http_err:
+        if response.status_code == 401:
+            refresh_session()
+            retry_headers = {
+                **headers,
+                "Authorization": f"Bearer {auth_token}"
+            }
+            
+            retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            if retry_resp.status_code == 401:
+                full_login()
+                retry_headers = {
+                    **headers,
+                    "Authorization": f"Bearer {auth_token}"
+                }
+                retry_resp = requests.post(url, headers=retry_headers, json=payload, timeout=20)
+            retry_resp.raise_for_status()
+            
+            try:
+                return retry_resp.json()
+            except ValueError:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Angel REST non-JSON response after refresh (status {retry_resp.status_code}): {retry_resp.text[:500]}"
+                )
+        
+        raise HTTPException(status_code=502, detail=f"Angel REST error: {http_err}")
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Angel REST network error: {str(e)}")
+
+def schedule_token_refresh():
+    """Schedule automatic token refresh every 5 hours"""
+    schedule.every(5).hours.do(refresh_session)
+    
+    def run_scheduler():
+        while True:
+            schedule.run_pending()
+            time_module.sleep(60)
+    
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    print(f"⏰ Auto-refresh scheduled every 5 hours")
 
 # ==================== OPTION TRADING FUNCTIONS ====================
 def get_available_indices() -> Dict[str, Dict]:
@@ -308,26 +596,241 @@ async def ensure_system_initialized():
             logger.error(f"❌ {error_msg}")
             return False
 
+# Initialize Angel One session on startup
+if all([api_key, client_id, password, totp_token]):
+    try:
+        if load_tokens_from_file() and refresh_token:
+            print("🚀 Using saved refresh token...")
+            refresh_session()
+        else:
+            print("🚀 No valid saved tokens, performing initial login...")
+            full_login()
+        
+        schedule_token_refresh()
+        print("✅ Angel One API initialized successfully! Will work for ~30 days without re-login!")
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize Angel One: {e}")
+else:
+    print("❌ Cannot initialize Angel One: Missing credentials")
+    print("Create a .env file with ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_TOKEN")
+
 # ==================== API ENDPOINTS ====================
 
 @app.get("/", tags=["System"])
 async def health_check():
+    token_age = None
+    if last_token_refresh:
+        token_age = str(datetime.now() - last_token_refresh)
+    
     return {
         "status": "healthy",
-        "service": "Unified Trading API - Option Trading & Chartink",
-        "version": "2.0.0",
+        "service": "Unified Trading API - Angel One + Option Trading System",
+        "version": "3.0.0",
         "timestamp": str(datetime.now()),
+        "angel_one": {
+            "session_active": auth_token is not None,
+            "refresh_token_available": refresh_token is not None,
+            "last_refresh": str(last_token_refresh) if last_token_refresh else None,
+            "token_age": token_age,
+            "credentials_loaded": bool(all([api_key, client_id, password, totp_token])),
+            "chartink_scanner": "enabled"
+        },
         "option_trading_system": {
             "available": TRADING_SYSTEM_AVAILABLE,
             "initialized": system_status["initialized"],
             "auto_initialize": True
         },
-        "chartink_scanner": "enabled",
         "endpoints": {
+            "angel_one_docs": "/docs#/Angel%20One",
             "option_trading_docs": "/docs#/Option%20Trading",
             "chartink_docs": "/docs#/Chartink"
         }
     }
+
+# ==================== ANGEL ONE ENDPOINTS ====================
+
+@app.post("/get-ohlc", tags=["Angel One"])
+async def get_ohlc(request: OHLCRequest):
+    """Get OHLC data for a single stock symbol"""
+    try:
+        api = ensure_valid_session()
+        
+        if not api:
+            raise HTTPException(status_code=500, detail="Angel One session not initialized")
+        
+        ohlc_data = api.ltpData(
+            exchange=request.exchange,
+            tradingsymbol=request.tradingSymbol,
+            symboltoken=request.symbolToken
+        )
+        
+        if ohlc_data and ohlc_data.get('status'):
+            data = ohlc_data.get('data', {})
+            response = {
+                "status": True,
+                "message": "SUCCESS",
+                "errorcode": "",
+                "data": {
+                    "fetched": [{
+                        "exchange": request.exchange,
+                        "tradingSymbol": request.tradingSymbol,
+                        "symbolToken": request.symbolToken,
+                        "ltp": data.get('ltp', 0),
+                        "open": data.get('open', 0),
+                        "high": data.get('high', 0),
+                        "low": data.get('low', 0),
+                        "close": data.get('close', 0)
+                    }],
+                    "unfetched": []
+                }
+            }
+            return response
+        else:
+            raise HTTPException(status_code=500, detail=ohlc_data.get('message', 'Failed to fetch OHLC data'))
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching OHLC data: {str(e)}")
+
+@app.post("/get-ohlc-batch", tags=["Angel One"])
+async def get_ohlc_batch(request: OHLCBatchRequest):
+    """Get OHLC data for multiple stock symbols"""
+    try:
+        api = ensure_valid_session()
+        
+        if not api:
+            raise HTTPException(status_code=500, detail="Angel One session not initialized")
+        
+        fetched = []
+        unfetched = []
+        
+        for symbol in request.symbols:
+            try:
+                ohlc_data = api.ltpData(
+                    exchange=symbol.get('exchange', 'NSE'),
+                    tradingsymbol=symbol['tradingSymbol'],
+                    symboltoken=symbol['symbolToken']
+                )
+                
+                if ohlc_data and ohlc_data.get('status'):
+                    data = ohlc_data.get('data', {})
+                    fetched.append({
+                        "exchange": symbol.get('exchange', 'NSE'),
+                        "tradingSymbol": symbol['tradingSymbol'],
+                        "symbolToken": symbol['symbolToken'],
+                        "ltp": data.get('ltp', 0),
+                        "open": data.get('open', 0),
+                        "high": data.get('high', 0),
+                        "low": data.get('low', 0),
+                        "close": data.get('close', 0)
+                    })
+                else:
+                    unfetched.append(symbol['tradingSymbol'])
+            except:
+                unfetched.append(symbol['tradingSymbol'])
+        
+        return {
+            "status": True,
+            "message": "SUCCESS",
+            "errorcode": "",
+            "data": {
+                "fetched": fetched,
+                "unfetched": unfetched
+            }
+        }
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching OHLC data: {str(e)}")
+
+@app.post("/get-market-movers", tags=["Angel One"])
+async def get_market_movers(request: MarketMoversRequest):
+    """Get top gainers/losers data via Angel One REST API."""
+    try:
+        ensure_valid_session()
+        data = fetch_market_movers_rest(datatype=request.datatype, expirytype=request.expirytype)
+        if data and data.get("status"):
+            return {
+                "status": True,
+                "message": "SUCCESS",
+                "errorcode": "",
+                "data": data.get("data", [])
+            }
+        raise HTTPException(status_code=500, detail=data.get("message", "Failed to fetch market movers"))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching market movers: {str(e)}")
+
+@app.get("/session-status", tags=["Angel One"])
+async def session_status():
+    """Get current Angel One session status"""
+    token_age = None
+    refresh_age = None
+    
+    if last_token_refresh:
+        token_age = str(datetime.now() - last_token_refresh)
+        refresh_age = (datetime.now() - last_token_refresh).days
+    
+    return {
+        "session_active": smart_api is not None,
+        "auth_token_exists": auth_token is not None,
+        "refresh_token_exists": refresh_token is not None,
+        "last_token_refresh": str(last_token_refresh) if last_token_refresh else None,
+        "token_age": token_age,
+        "days_since_refresh": refresh_age,
+        "days_until_expiry": 30 - refresh_age if refresh_age is not None else None,
+        "current_time": str(datetime.now()),
+        "credentials_status": {
+            "api_key_loaded": bool(api_key),
+            "client_id_loaded": bool(client_id),
+            "password_loaded": bool(password),
+            "totp_token_loaded": bool(totp_token)
+        },
+        "chartink_scanner": "active"
+    }
+
+@app.post("/refresh-session", tags=["Angel One"])
+async def manual_refresh_session():
+    """Manually refresh the Angel One session"""
+    try:
+        refresh_session()
+        return {
+            "message": "Session refreshed successfully",
+            "timestamp": str(datetime.now()),
+            "last_refresh": str(last_token_refresh)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error refreshing session: {str(e)}")
+
+@app.post("/force-full-login", tags=["Angel One"])
+async def force_full_login():
+    """Force a full TOTP login for Angel One"""
+    try:
+        full_login()
+        return {
+            "message": "Full login completed successfully",
+            "timestamp": str(datetime.now()),
+            "last_refresh": str(last_token_refresh),
+            "refresh_token_saved": bool(refresh_token)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error during full login: {str(e)}")
+
+@app.delete("/delete-saved-tokens", tags=["Angel One"])
+async def delete_saved_tokens():
+    """Delete saved Angel One tokens file"""
+    try:
+        if TOKEN_FILE.exists():
+            TOKEN_FILE.unlink()
+            return {"message": "Saved tokens deleted successfully"}
+        else:
+            return {"message": "No saved tokens found"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting tokens: {str(e)}")
 
 # ==================== CHARTINK ENDPOINTS ====================
 
@@ -551,7 +1054,7 @@ async def health_check_endpoint():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.0.0",
+        "version": "3.0.0",
         "auto_initialize": True
     }
 
@@ -560,8 +1063,8 @@ async def health_check_endpoint():
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Unified Trading API Server starting up...")
+    logger.info(f"📊 Angel One API: {'✅ Initialized' if auth_token else '❌ Not initialized'}")
     logger.info(f"📊 Option Trading System Available: {TRADING_SYSTEM_AVAILABLE}")
-    logger.info("📊 Chartink Scanner: ✅ Active")
     logger.info("🔄 Auto-initialization enabled for Option Trading System")
     logger.info("✅ Server ready to accept connections")
 
@@ -584,8 +1087,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info("🌟 Starting Unified Trading API Server")
     logger.info(f"📚 API Documentation: http://localhost:{port}/docs")
+    logger.info("🔄 Angel One: Auto-refresh enabled")
     logger.info("🔄 Option Trading System: Auto-initialize on first request")
-    logger.info("📊 Chartink Scanner: Ready")
     
     uvicorn.run(
         app,
